@@ -21,7 +21,7 @@ def pr_curve(y_true, score) -> tuple[np.ndarray, np.ndarray]:
 
     tp = np.cumsum(y)
     k = np.arange(1, len(y) + 1)
-    ends = np.r_[s[1:] != s[:-1], True]      # последняя строка каждой группы равных score
+    ends = np.r_[s[1:] != s[:-1], True]      # последняя 
     return tp[ends] / k[ends], tp[ends] / n_pos
 
 
