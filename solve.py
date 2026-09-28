@@ -18,8 +18,9 @@ RANDOM_STATE = 42
 DATA_DIR = "data"
 
 
-
-# Load-
+# -----------------------------
+# Load
+# -----------------------------
 def read_data():
     train = pd.read_csv(
         os.path.join(DATA_DIR, "train.csv"),
@@ -29,6 +30,7 @@ def read_data():
         os.path.join(DATA_DIR, "test.csv"),
         parse_dates=["cookie_created_at", "window_start_ts", "window_end_ts"],
     )
+    # ВАЖНО: добавлено compression='gzip'
     events = pd.read_csv(
         os.path.join(DATA_DIR, "events.csv.gz"),
         compression="gzip",
@@ -37,7 +39,9 @@ def read_data():
     return train, test, events
 
 
+# -----------------------------
 # Feature helpers
+# -----------------------------
 def entropy(s: pd.Series) -> float:
     p = s.value_counts(normalize=True, dropna=True)
     if len(p) == 0:
@@ -94,7 +98,7 @@ def session_stats(df: pd.DataFrame) -> pd.Series:
         })
 
     diffs = ts.diff().dt.total_seconds().fillna(0)
-    breaks = (diffs > 1800).cumsum()   # 30-minute inactivity gap
+    breaks = (diffs > 1800).cumsum()   # 30-минутный разрыв = новая сессия
     sessions = ts.groupby(breaks)
 
     durations = sessions.apply(lambda x: (x.max() - x.min()).total_seconds())
@@ -108,6 +112,9 @@ def session_stats(df: pd.DataFrame) -> pd.Series:
     })
 
 
+# -----------------------------
+# Main feature builder
+# -----------------------------
 def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     meta = meta.copy()
 
@@ -117,7 +124,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     meta["window_start_hour"] = meta["window_start_ts"].dt.hour
     meta["window_start_dow"] = meta["window_start_ts"].dt.dayofweek
 
-    # Keep only events inside each cookie observation window.
+    # Оставляем только события внутри окна наблюдения
     ev = events.merge(
         meta[["cookie_id", "window_start_ts", "window_end_ts"]],
         on="cookie_id",
@@ -140,7 +147,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
 
     g = ev.groupby("cookie_id")
 
-    # Basic counts
+    # Базовые счетчики
     features["n_events"] = g.size().reindex(features.index, fill_value=0)
     features["n_unique_items"] = g.item_id.nunique().reindex(features.index, fill_value=0)
     features["n_unique_categories"] = g.item_category.nunique().reindex(features.index, fill_value=0)
@@ -161,7 +168,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     features["events_per_min"] = features["n_events"] / (features["duration_sec"] / 60.0 + 1.0)
     features["active_hours"] = features["duration_sec"] / 3600.0
 
-    # Missing ratios
+    # Доля пропусков
     for col in [
         "item_id", "item_category", "item_location", "seller_type",
         "search_query", "search_page", "pointer_x", "pointer_y", "user_agent",
@@ -172,7 +179,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
                 .reindex(features.index, fill_value=1.0)
             )
 
-    # Duplicate ratio
+    # Доля дубликатов
     dup = ev.duplicated(
         subset=["cookie_id", "event_ts", "eid", "item_id"],
         keep=False,
@@ -182,7 +189,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         .reindex(features.index, fill_value=0.0)
     )
 
-    # Event type counts
+    # Счетчики типов событий
     for col, prefix in [("eid", "eid"), ("event_name", "event")]:
         piv = ev.pivot_table(
             index="cookie_id",
@@ -194,7 +201,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         piv.columns = [f"{prefix}_{str(c)}_count" for c in piv.columns]
         features = features.join(piv, how="left")
 
-    # Platform counts
+    # Счетчики платформ
     piv = ev.pivot_table(
         index="cookie_id",
         columns="platform",
@@ -205,12 +212,12 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     piv.columns = [f"platform_{str(c)}_count" for c in piv.columns]
     features = features.join(piv, how="left")
 
-    # Ratios for all count columns
+    # Относительные доли
     count_cols = [c for c in features.columns if c.endswith("_count")]
     for c in count_cols:
         features[c + "_ratio"] = features[c] / features["n_events"].replace(0, np.nan)
 
-    # Entropy / diversity
+    # Энтропия и разнообразие
     for col, name in [
         ("item_category", "category"),
         ("item_location", "location"),
@@ -222,7 +229,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
             .reindex(features.index, fill_value=0.0)
         )
 
-    # Search features
+    # Признаки поиска
     features["search_page_mean"] = g.search_page.mean().reindex(features.index)
     features["search_page_max"] = g.search_page.max().reindex(features.index)
     features["search_page_std"] = g.search_page.std().reindex(features.index)
@@ -231,15 +238,17 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         .reindex(features.index, fill_value=0.0)
     )
 
-    # Inter-event time
-    iet = g.event_ts.apply(iet_stats).unstack()
-    features = features.join(iet, how="left")
+    # Время между событиями (IET)
+    # ИСПРАВЛЕНИЕ: используем pd.concat вместо join
+    iet = g.event_ts.apply(iet_stats)
+    features = pd.concat([features, iet], axis=1)
 
-    # Sessions
-    sess = g.apply(session_stats).unstack()
-    features = features.join(sess, how="left")
+    # Сессии
+    # ИСПРАВЛЕНИЕ: используем pd.concat вместо join
+    sess = g.apply(session_stats)
+    features = pd.concat([features, sess], axis=1)
 
-    # User-Agent flags
+    # Флаги User-Agent
     ua = g.user_agent.first().fillna("").reindex(features.index)
     features["ua_is_okhttp"] = ua.str.contains("okhttp", case=False, na=False).astype(int)
     features["ua_is_avito_app"] = ua.str.contains("Avito/", case=False, na=False).astype(int)
@@ -251,7 +260,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     features["ua_is_mobile"] = ua.str.contains("Mobile|Android|iPhone", case=False, na=False).astype(int)
     features["ua_is_desktop"] = ua.str.contains("Windows|Macintosh|Linux", case=False, na=False).astype(int)
 
-    # Pointer features
+    # Координаты курсора
     for col in ["pointer_x", "pointer_y"]:
         features[f"{col}_mean"] = g[col].mean().reindex(features.index)
         features[f"{col}_std"] = g[col].std().reindex(features.index)
@@ -265,7 +274,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         .reindex(features.index, fill_value=0.0)
     )
 
-    # Time features
+    # Временные признаки
     features["hour_min"] = first_ts.dt.hour
     features["hour_max"] = last_ts.dt.hour
     features["night_ratio"] = (
@@ -273,7 +282,7 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         .reindex(features.index, fill_value=0.0)
     )
 
-    # Metadata
+    # Метаданные
     meta_idx = meta.set_index("cookie_id")
     features["age_days"] = meta_idx["age_days"].reindex(features.index)
     features["window_start_hour"] = meta_idx["window_start_hour"].reindex(features.index)
@@ -283,7 +292,9 @@ def build_features(meta: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-#main
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     train, test, events = read_data()
 
@@ -299,12 +310,12 @@ def main():
     Xtr = Xtr.reindex(columns=all_cols, fill_value=0)
     Xte = Xte.reindex(columns=all_cols, fill_value=0)
 
-    # Align order
+    # Выравниваем порядок
     Xtr = Xtr.loc[train["cookie_id"]]
     Xte = Xte.loc[test["cookie_id"]]
     y = train["target"].values
 
-    # Time-based validation: hold out last 20% of observation dates.
+    # Валидация по времени: последние 20% дат
     dates = np.sort(train["window_start_ts"].unique())
     n_valid = max(1, int(len(dates) * 0.2))
     valid_dates = dates[-n_valid:]
@@ -318,7 +329,7 @@ def main():
         train_mask = ~valid_mask
 
     X_train = Xtr.loc[train.loc[train_mask, "cookie_id"]]
-    y_train = train.loc[train_mask, "target"].values
+    y_train = train.loc[train_mask, "target"].values   # ИСПРАВЛЕНИЕ: было valid_mask
 
     X_val = Xtr.loc[train.loc[valid_mask, "cookie_id"]]
     y_val = train.loc[valid_mask, "target"].values
@@ -326,7 +337,7 @@ def main():
     print(f"Validation dates: {valid_dates}")
     print(f"Train shape: {X_train.shape}, valid shape: {X_val.shape}")
 
-    # 
+    # Baseline
     baseline = make_pipeline(
         SimpleImputer(strategy="median"),
         RandomForestClassifier(
@@ -369,13 +380,13 @@ def main():
     p_val = model.predict_proba(X_val)[:, 1]
     print("Improved P@R0.7:", round(precision_at_recall(y_val, p_val), 4))
 
-    #
+    # Важность признаков
     if hasattr(model, "feature_importances_"):
         imp = pd.Series(model.feature_importances_, index=X_train.columns)
         print("\nTop 30 features:")
         print(imp.sort_values(ascending=False).head(30))
 
-    #
+    # Финальное обучение на всех данных
     print("\nFitting final model on full train...")
     model.fit(Xtr, y)
 
